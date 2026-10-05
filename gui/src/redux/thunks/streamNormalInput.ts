@@ -10,6 +10,8 @@ import {
   addPromptCompletionPair,
   errorToolCall,
   setActive,
+  setCompactionLoading,
+  updateHistoryItemAtIndex,
   setAppliedRulesAtIndex,
   setContextPercentage,
   setInactive,
@@ -19,6 +21,11 @@ import {
   streamUpdate,
 } from "../slices/sessionSlice";
 import { ThunkApiType } from "../store";
+import {
+  AUTO_COMPACTION_THRESHOLD,
+  getCompactionIndex,
+  summarizeForContinuation,
+} from "../util/automaticCompaction";
 import { constructMessages } from "../util/constructMessages";
 
 import { modelSupportsNativeTools } from "core/llm/toolSupport";
@@ -152,7 +159,7 @@ export const streamNormalInput = createAsyncThunk<
       return { ...item, message: messageWithoutId };
     });
 
-    const { messages, appliedRules, appliedRuleIndex } = constructMessages(
+    let { messages, appliedRules, appliedRuleIndex } = constructMessages(
       withoutMessageIds,
       systemMessage,
       state.config.config.rules,
@@ -172,10 +179,87 @@ export const streamNormalInput = createAsyncThunk<
     dispatch(setActive());
     dispatch(setInlineErrorMessage(undefined));
 
-    const precompiledRes = await extra.ideMessenger.request("llm/compileChat", {
+    let precompiledRes = await extra.ideMessenger.request("llm/compileChat", {
       messages,
       options: completionOptions,
     });
+
+    const needsCompaction =
+      precompiledRes.status === "error"
+        ? precompiledRes.error.includes("Not enough context")
+        : precompiledRes.content.didPrune ||
+          precompiledRes.content.contextPercentage >= AUTO_COMPACTION_THRESHOLD;
+    const compactIndex = getCompactionIndex(state.session.history);
+    if (needsCompaction && compactIndex >= 0) {
+      const signal = state.session.streamAborter.signal;
+      const isCurrent = () =>
+        !signal.aborted &&
+        getState().session.id === state.session.id &&
+        getState().session.history.length === state.session.history.length &&
+        getState().session.history[compactIndex]?.message.id ===
+          state.session.history[compactIndex].message.id;
+      dispatch(setCompactionLoading({ index: compactIndex, loading: true }));
+      try {
+        // Summarize the live Redux snapshot, not potentially stale saved history.
+        const prefix = constructMessages(
+          withoutMessageIds.slice(0, compactIndex + 1),
+          undefined,
+          [],
+          {},
+          systemToolsFramework,
+        ).messages;
+        const summary = await summarizeForContinuation(
+          prefix,
+          selectedChatModel,
+          extra.ideMessenger,
+          signal,
+        );
+        if (!isCurrent()) return;
+        dispatch(
+          updateHistoryItemAtIndex({
+            index: compactIndex,
+            updates: { conversationSummary: summary },
+          }),
+        );
+        ({ messages, appliedRules, appliedRuleIndex } = constructMessages(
+          getState().session.history,
+          systemMessage,
+          state.config.config.rules,
+          state.ui.ruleSettings,
+          systemToolsFramework,
+        ));
+        // A completed tool turn can leave only the summary/system message.
+        if (!messages.some((message) => message.role !== "system")) {
+          messages.push({
+            role: "user",
+            content:
+              "Continue the unfinished user request from the summary. Do not repeat completed actions.",
+          });
+        }
+        dispatch(
+          setAppliedRulesAtIndex({ index: appliedRuleIndex, appliedRules }),
+        );
+        // One bounded recovery attempt: never recursively compact a failing prompt.
+        precompiledRes = await extra.ideMessenger.request("llm/compileChat", {
+          messages,
+          options: completionOptions,
+        });
+        if (!isCurrent()) return;
+      } catch (error) {
+        if (!isCurrent()) return;
+        throw error;
+      } finally {
+        if (getState().session.id === state.session.id)
+          dispatch(
+            setCompactionLoading({ index: compactIndex, loading: false }),
+          );
+      }
+    }
+    if (
+      state.session.streamAborter.signal.aborted ||
+      getState().session.id !== state.session.id
+    )
+      return;
 
     if (precompiledRes.status === "error") {
       if (precompiledRes.error.includes("Not enough context")) {
